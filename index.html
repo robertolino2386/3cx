@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dashboard Ligações 3CX – Conciliação | Copastur</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -193,6 +194,19 @@
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--verde); animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
+  .status-dados {
+    padding: 10px 28px 0;
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+    font-size: .78rem; color: var(--sub);
+  }
+  .btn-arquivo {
+    background: #fff; color: var(--azul); border: 1.5px solid var(--borda);
+    border-radius: 6px; padding: 6px 12px; font-size: .76rem; font-weight: 700;
+    cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  .btn-arquivo:hover { border-color: var(--azul); }
+  #inputArquivo { display: none; }
+
   /* sem dados */
   .empty { text-align: center; padding: 40px; color: #bbb; font-size: .9rem; }
 </style>
@@ -238,6 +252,12 @@
   </div>
   <span class="filtros-info" id="filtros-info"></span>
   <button class="btn-reset" onclick="resetar()">↺ Limpar</button>
+</div>
+
+<div class="status-dados">
+  <button class="btn-arquivo" onclick="document.getElementById('inputArquivo').click()">📤 Carregar Excel manualmente</button>
+  <input type="file" id="inputArquivo" accept=".xlsx,.xls,.csv" onchange="carregarArquivoManual(event)">
+  <span id="statusDados">Carregando dados da planilha...</span>
 </div>
 
 <!-- CARDS -->
@@ -301,65 +321,125 @@
        target="_blank">Controle de Ligações 3CX - 2026.xlsx</a>
     · Aba: Consulta1
   </span>
-  <span class="badge-update"><span class="dot"></span> Dados de demonstração</span>
+  <span class="badge-update"><span class="dot"></span> Dados reais / SharePoint</span>
   <span>Dashboard Conciliação · Copastur · 2026</span>
 </footer>
 
 <script>
 // ═══════════════════════════════════════════════════════════════
-// DADOS
-// Estrutura espelha as colunas da aba Consulta1:
-// Colaborador | Data | Nome do Mês | Ano | Dia | Call Time | Ringing | Talking
-//
-// Para conectar dados reais, substitua o array DADOS abaixo pelo
-// resultado exportado da aba Consulta1 (formato JSON).
+// CONFIGURAÇÃO DA FONTE DE DADOS
 // ═══════════════════════════════════════════════════════════════
+const SHAREPOINT_URL = "https://copasturcombr.sharepoint.com/:x:/s/Financeiro/IQDok5CNQQHKTLUCjS1ikKFoAXBBpHcwLcvJ4bbEHLqH1-E?e=GGYHZh";
+const SHAREPOINT_DOWNLOAD_URL = SHAREPOINT_URL + "&download=1";
+const ABA_PADRAO = "Consulta1";
 
 const MESES_ORD = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
                    "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
 
-const NOMES = ["Ana Souza","Carlos Lima","Fernanda Reis","Gustavo Pinto",
-               "Juliana Mendes","Lucas Alves","Mariana Costa","Pedro Rocha",
-               "Renata Silva","Thiago Moura"];
-
 const CORES = ["#0f3460","#e94560","#f5a623","#27ae60","#8e44ad",
-               "#2980b9","#e67e22","#16a085","#c0392b","#2c3e50"];
+               "#2980b9","#e67e22","#16a085","#c0392b","#2c3e50",
+               "#34495e","#7f8c8d","#d35400","#2ecc71","#9b59b6"];
 
-// Gera dados de exemplo (Jan–Jun 2026)
-function rng(a,b){ return Math.floor(Math.random()*((b-a)+1))+a; }
-const DADOS = [];
-[1,2,3,4,5,6].forEach(m => {
-  const dias = new Date(2026,m,0).getDate();
-  NOMES.forEach(nome => {
-    const qtd = rng(3,20);
-    for(let i=0;i<qtd;i++){
-      const d = rng(1,dias);
-      DADOS.push({
-        colaborador: nome,
-        mes: MESES_ORD[m-1],
-        ano: 2026,
-        dia: d,
-        talking: rng(30,600)   // segundos de conversa
-      });
-    }
-  });
-});
+let DADOS = [];
+let NOMES = [];
+let gB, gR, gL;
 
-// ═══════════════════════════════════════════════════════════════
-// FILTROS
-// ═══════════════════════════════════════════════════════════════
-function popFiltros(){
-  const anos   = [...new Set(DADOS.map(d=>d.ano))].sort();
+function setStatus(msg){
+  const el = document.getElementById('statusDados');
+  if(el) el.textContent = msg;
+}
+
+function normalizarTexto(v){
+  return String(v ?? '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .trim().toLowerCase();
+}
+
+function pegar(row, nomesPossiveis){
+  const mapa = {};
+  Object.keys(row).forEach(k => mapa[normalizarTexto(k)] = row[k]);
+  for(const nome of nomesPossiveis){
+    const chave = normalizarTexto(nome);
+    if(Object.prototype.hasOwnProperty.call(mapa, chave)) return mapa[chave];
+  }
+  return '';
+}
+
+function mesPorNumero(n){
+  const idx = Number(n) - 1;
+  return MESES_ORD[idx] || '';
+}
+
+function interpretarData(valor){
+  if(valor instanceof Date && !isNaN(valor)) return valor;
+
+  if(typeof valor === 'number'){
+    const parsed = XLSX.SSF.parse_date_code(valor);
+    if(parsed) return new Date(parsed.y, parsed.m - 1, parsed.d);
+  }
+
+  const txt = String(valor ?? '').trim();
+  if(!txt) return null;
+
+  const partesBR = txt.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if(partesBR){
+    let ano = Number(partesBR[3]);
+    if(ano < 100) ano += 2000;
+    return new Date(ano, Number(partesBR[2]) - 1, Number(partesBR[1]));
+  }
+
+  const d = new Date(txt);
+  return isNaN(d) ? null : d;
+}
+
+function normalizarRegistro(row){
+  const colaborador = String(pegar(row, ['Colaborador','Nome','Usuário','Usuario','Agente','Atendente','Extension Name','From']) || '').trim();
+  if(!colaborador) return null;
+
+  const dataBruta = pegar(row, ['Data','Date','Call Date','Dia']);
+  const data = interpretarData(dataBruta);
+
+  let ano = Number(pegar(row, ['Ano','Year'])) || (data ? data.getFullYear() : null);
+  let dia = Number(pegar(row, ['Dia','Day'])) || (data ? data.getDate() : null);
+
+  let mes = String(pegar(row, ['Nome do Mês','Nome do Mes','Mês','Mes','Month']) || '').trim();
+  if(!mes && data) mes = MESES_ORD[data.getMonth()];
+  if(/^\d+$/.test(mes)) mes = mesPorNumero(mes);
+  if(mes){
+    const achado = MESES_ORD.find(m => normalizarTexto(m).startsWith(normalizarTexto(mes).slice(0,3)));
+    mes = achado || mes;
+  }
+
+  if(!ano || !mes || !dia) return null;
+
+  return {
+    colaborador,
+    mes,
+    ano,
+    dia,
+    talking: pegar(row, ['Talking','Tempo Falado','Falando','Talk Time','Call Time']) || 0
+  };
+}
+
+function limparSelect(id){
+  const el = document.getElementById(id);
+  el.innerHTML = '<option value="">Todos</option>';
+}
+
+function popularFiltros(){
+  ['fAno','fMes','fDia','fColab'].forEach(limparSelect);
+
+  const anos   = [...new Set(DADOS.map(d=>d.ano))].sort((a,b)=>a-b);
   const meses  = MESES_ORD.filter(m=>[...new Set(DADOS.map(d=>d.mes))].includes(m));
   const dias   = [...new Set(DADOS.map(d=>d.dia))].sort((a,b)=>a-b);
-  const colabs = [...new Set(DADOS.map(d=>d.colaborador))].sort();
+  const colabs = [...new Set(DADOS.map(d=>d.colaborador))].sort((a,b)=>a.localeCompare(b,'pt-BR'));
 
   const add = (id, vals, fmt) =>
     vals.forEach(v => document.getElementById(id).add(new Option(fmt?fmt(v):v, v)));
 
-  add('fAno',   anos);
-  add('fMes',   meses);
-  add('fDia',   dias, v => v<10?'0'+v:v);
+  add('fAno', anos);
+  add('fMes', meses);
+  add('fDia', dias, v => Number(v)<10?'0'+Number(v):v);
   add('fColab', colabs);
 }
 
@@ -379,9 +459,6 @@ function resetar(){
   render();
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CARDS
-// ═══════════════════════════════════════════════════════════════
 function atualizaCards(df){
   const total  = df.length;
   const colabs = [...new Set(df.map(d=>d.colaborador))];
@@ -408,31 +485,27 @@ function atualizaCards(df){
   if(c) labels.push(c.split(' ')[0]);
   document.getElementById('cPeriodo').textContent = labels.length ? labels.join(' · ') : 'todo o período';
 
-  const n = Object.keys(cnt).length;
-  const total2 = df.length;
   document.getElementById('filtros-info').textContent =
-    total2 > 0 ? `${total2} registros · ${n} colaboradores` : '';
+    total > 0 ? `${total} registros · ${Object.keys(cnt).length} colaboradores` : '';
 }
 
-// ═══════════════════════════════════════════════════════════════
-// GRÁFICOS
-// ═══════════════════════════════════════════════════════════════
-let gB, gR, gL;
+function corColaborador(nome){
+  const idx = Math.max(0, NOMES.indexOf(nome));
+  return CORES[idx % CORES.length];
+}
 
 function atualizaGraficos(df){
-  // --- Barras: por colaborador ---
   const cntC = {};
   df.forEach(d=>{ cntC[d.colaborador]=(cntC[d.colaborador]||0)+1; });
   const sortC = Object.entries(cntC).sort((a,b)=>b[1]-a[1]);
   const labC  = sortC.map(([n])=>{ const p=n.split(' '); return p[0]+' '+(p[1]?.charAt(0)||'')+'.'; });
   const valC  = sortC.map(([,v])=>v);
-  const corC  = NOMES.map((_,i)=>CORES[i%CORES.length]);
 
   if(gB) gB.destroy();
   gB = new Chart(document.getElementById('gBarras'),{
     type:'bar',
     data:{ labels:labC, datasets:[{ label:'Ligações', data:valC,
-      backgroundColor: sortC.map(([n])=>CORES[NOMES.indexOf(n)%CORES.length]),
+      backgroundColor: sortC.map(([n])=>corColaborador(n)),
       borderRadius:5, borderSkipped:false }] },
     options:{ responsive:true, maintainAspectRatio:false,
       plugins:{ legend:{display:false}, tooltip:{callbacks:{label:c=>` ${c.raw} ligações`}} },
@@ -440,7 +513,6 @@ function atualizaGraficos(df){
                y:{beginAtZero:true,grid:{color:'#f0f0f0'},ticks:{font:{size:11}}} } }
   });
 
-  // --- Rosca: por mês ---
   const cntM = {};
   df.forEach(d=>{ cntM[d.mes]=(cntM[d.mes]||0)+1; });
   const sortM = MESES_ORD.filter(m=>cntM[m]).map(m=>[m.substring(0,3),cntM[m]]);
@@ -450,13 +522,12 @@ function atualizaGraficos(df){
     type:'doughnut',
     data:{ labels:sortM.map(([l])=>l), datasets:[{
       data:sortM.map(([,v])=>v),
-      backgroundColor:CORES.slice(0,sortM.length), borderWidth:2, borderColor:'#fff' }] },
+      backgroundColor:CORES.slice(0,Math.max(sortM.length,1)), borderWidth:2, borderColor:'#fff' }] },
     options:{ responsive:true, maintainAspectRatio:false,
       plugins:{ legend:{position:'bottom',labels:{font:{size:11},padding:8}},
         tooltip:{callbacks:{label:c=>` ${c.label}: ${c.raw} ligações`}} } }
   });
 
-  // --- Linha: evolução mensal ---
   const mesesComDados = MESES_ORD.filter(m=>cntM[m]);
   if(gL) gL.destroy();
   gL = new Chart(document.getElementById('gLinha'),{
@@ -473,9 +544,6 @@ function atualizaGraficos(df){
   });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// RANKING
-// ═══════════════════════════════════════════════════════════════
 function atualizaRanking(df){
   const cnt = {};
   df.forEach(d=>{ cnt[d.colaborador]=(cnt[d.colaborador]||0)+1; });
@@ -489,7 +557,7 @@ function atualizaRanking(df){
   tbody.innerHTML = sorted.map(([nome,qtd],i)=>{
     const pct  = total ? Math.round(qtd/total*100) : 0;
     const barW = Math.round(qtd/sorted[0][1]*100);
-    const cor  = CORES[NOMES.indexOf(nome)%CORES.length];
+    const cor  = corColaborador(nome);
     return `<tr>
       <td style="font-weight:700;color:var(--azul)">${medals[i]||'#'+(i+1)}</td>
       <td>${nome}</td>
@@ -500,9 +568,6 @@ function atualizaRanking(df){
   }).join('');
 }
 
-// ═══════════════════════════════════════════════════════════════
-// RENDER PRINCIPAL
-// ═══════════════════════════════════════════════════════════════
 function render(){
   const df = filtrado();
   atualizaCards(df);
@@ -510,9 +575,53 @@ function render(){
   atualizaRanking(df);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// RELÓGIO
-// ═══════════════════════════════════════════════════════════════
+function aplicarDados(rows, origem){
+  DADOS = rows.map(normalizarRegistro).filter(Boolean);
+  NOMES = [...new Set(DADOS.map(d=>d.colaborador))].sort((a,b)=>a.localeCompare(b,'pt-BR'));
+  popularFiltros();
+  render();
+  setStatus(DADOS.length ? `${DADOS.length.toLocaleString('pt-BR')} registros carregados de ${origem}.` : `Arquivo carregado, mas nenhuma linha válida foi encontrada na aba ${ABA_PADRAO}.`);
+}
+
+function workbookParaRows(workbook){
+  const sheetName = workbook.SheetNames.includes(ABA_PADRAO) ? ABA_PADRAO : workbook.SheetNames[0];
+  const ws = workbook.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(ws, { defval:'', raw:false });
+}
+
+async function carregarSharePoint(){
+  setStatus('Carregando dados da planilha do SharePoint...');
+  try{
+    const resp = await fetch(SHAREPOINT_DOWNLOAD_URL, { cache:'no-store' });
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    const buf = await resp.arrayBuffer();
+    const wb = XLSX.read(buf, { type:'array', cellDates:true });
+    aplicarDados(workbookParaRows(wb), 'SharePoint');
+  }catch(err){
+    console.warn('Falha ao carregar SharePoint:', err);
+    setStatus('Não consegui ler direto do SharePoint. Clique em "Carregar Excel manualmente" e selecione o arquivo baixado.');
+    aplicarDados([], 'SharePoint');
+  }
+}
+
+function carregarArquivoManual(event){
+  const file = event.target.files && event.target.files[0];
+  if(!file) return;
+  setStatus('Lendo arquivo selecionado...');
+  const reader = new FileReader();
+  reader.onload = e => {
+    try{
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type:'array', cellDates:true });
+      aplicarDados(workbookParaRows(wb), file.name);
+    }catch(err){
+      console.error(err);
+      setStatus('Não foi possível ler o arquivo. Verifique se é .xlsx, .xls ou .csv.');
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
 function tick(){
   const now = new Date();
   document.getElementById('relogio').textContent =
@@ -521,11 +630,7 @@ function tick(){
 }
 tick(); setInterval(tick, 1000);
 
-// ═══════════════════════════════════════════════════════════════
-// INIT
-// ═══════════════════════════════════════════════════════════════
-popFiltros();
-render();
+carregarSharePoint();
 </script>
 </body>
 </html>
